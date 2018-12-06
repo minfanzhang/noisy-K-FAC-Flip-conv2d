@@ -1,0 +1,860 @@
+/h/minfanzh/noisy-K-FAC_use_all_FC/main.py
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import tensorflow as tf
+import numpy as np
+import os
+
+from misc.utils import get_logger, get_args, makedirs
+from misc.config import process_config
+from misc.data_loader import load_pytorch
+from core.model import Model
+from core.train import Trainer
+
+
+_INPUT_DIM = {
+    'fmnist': [784],
+    'mnist': [784],
+    'cifar10': [32, 32, 3],
+    'cifar100': [32, 32, 3]
+}
+
+
+def main():
+    tf.set_random_seed(1231)
+    np.random.seed(1231)
+
+    try:
+        args = get_args()
+        config = process_config(args.config)
+    except:
+        print("Add a config file using \'--config file_name.json\'")
+        exit(1)
+
+    makedirs(config.summary_dir)
+    makedirs(config.checkpoint_dir)
+
+    # set logger
+    path = os.path.dirname(os.path.abspath(__file__))
+    path1 = os.path.join(path, 'core/model.py')
+    path2 = os.path.join(path, 'core/train.py')
+    logger = get_logger('log', logpath=config.summary_dir+'/',
+                        filepath=os.path.abspath(__file__), package_files=[path1, path2])
+
+    logger.info(config)
+
+    # load data
+    train_loader, test_loader = load_pytorch(config)
+
+    # define computational graph
+    sess = tf.Session()
+
+    model_ = Model(config, _INPUT_DIM[config.dataset], len(train_loader.dataset))
+    trainer = Trainer(sess, model_, train_loader, test_loader, config, logger)
+
+    trainer.train()
+
+
+if __name__ == "__main__":
+    main()
+
+/h/minfanzh/noisy-K-FAC_use_all_FC/core/model.py
+import tensorflow as tf
+
+from ops import optimizer as opt
+from ops import layer_collection as lc
+from ops import sampler as sp
+from network.registry import get_model
+from core.base_model import BaseModel
+
+
+class Model(BaseModel):
+    def __init__(self, config, input_dim, n_data):
+        super().__init__(config)
+        self.layer_collection = lc.LayerCollection()
+        self.input_dim = input_dim
+        self.n_data = n_data
+
+        self.cov_update_op = None
+        self.inv_update_op = None
+
+        self.build_model()
+        self.init_optim()
+        self.init_saver()
+
+    @property
+    def trainable_variables(self):
+        # note: we don't train the params of BN
+        vars = []
+        for var in tf.trainable_variables():
+            if "w" in var.name:
+                vars.append(var)
+        return vars
+
+    def build_model(self):
+        self.inputs = tf.placeholder(tf.float32, [None] + self.input_dim)
+        self.targets = tf.placeholder(tf.int64, [None])
+        self.is_training = tf.placeholder(tf.bool)
+        self.n_particles = tf.placeholder(tf.int32)
+
+        inputs = self.inputs
+        net = get_model(self.config.model_name)
+
+        self.sampler = sp.Sampler(self.config, self.n_data, self.n_particles)
+        logits, l2_loss = net(inputs, self.sampler, self.is_training,
+                              self.config.batch_norm, self.layer_collection,
+                              self.n_particles)
+
+        # ensemble
+        logits_ = tf.reduce_mean(
+            tf.reshape(logits, [self.n_particles, -1, tf.shape(logits)[-1]]), 0)
+        self.acc = tf.reduce_mean(tf.cast(tf.equal(
+            self.targets, tf.argmax(logits_, axis=1)), dtype=tf.float32))
+
+        targets_ = tf.tile(self.targets, [self.n_particles])
+        self.loss = tf.reduce_mean(
+            tf.nn.sparse_softmax_cross_entropy_with_logits(
+                labels=targets_, logits=logits))
+
+        coeff = self.config.kl / (self.n_data * self.config.eta)
+        self.total_loss = self.loss + coeff * l2_loss
+
+    def init_optim(self):
+        self.optim = opt.KFACOptimizer(var_list=self.trainable_variables,
+                                       learning_rate=self.config.learning_rate,
+                                       cov_ema_decay=self.config.cov_ema_decay,
+                                       damping=self.config.damping,
+                                       layer_collection=self.layer_collection,
+                                       norm_constraint=tf.train.exponential_decay(self.config.kl_clip,
+                                                                                  self.global_step_tensor,
+                                                                                  390, 0.95, staircase=True),
+                                       momentum=self.config.momentum)
+
+        self.cov_update_op = self.optim.cov_update_op
+        self.inv_update_op = self.optim.inv_update_op
+
+        with tf.control_dependencies([self.inv_update_op]):
+            self.var_update_op = self.sampler.update(self.layer_collection.get_blocks())
+
+        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+        with tf.control_dependencies(update_ops):
+            self.train_op = self.optim.minimize(self.total_loss, global_step=self.global_step_tensor)
+
+    def init_saver(self):
+        self.saver = tf.train.Saver(max_to_keep=self.config.max_to_keep)
+
+
+/h/minfanzh/noisy-K-FAC_use_all_FC/core/train.py
+from core.base_train import BaseTrain
+from tqdm import tqdm
+import numpy as np
+
+
+class Trainer(BaseTrain):
+    def __init__(self, sess, model, train_loader, test_loader, config, logger):
+        super(Trainer, self).__init__(sess, model, config, logger)
+        self.train_loader = train_loader
+        self.test_loader = test_loader
+
+    def train(self):
+        for cur_epoch in range(self.config.epoch):
+            self.logger.info('epoch: {}'.format(int(cur_epoch)))
+            self.train_epoch()
+            self.test_epoch()
+
+    def train_epoch(self):
+        loss_list = []
+        acc_list = []
+        for itr, (x, y) in enumerate(tqdm(self.train_loader)):
+            feed_dict = {
+                self.model.inputs: x,
+                self.model.targets: y,
+                self.model.n_particles: self.config.train_particles
+            }
+
+            feed_dict.update({self.model.is_training: True})
+            self.sess.run([self.model.train_op], feed_dict=feed_dict)
+
+            feed_dict.update({self.model.is_training: False})  # note: that's important
+            loss, acc = self.sess.run([self.model.loss, self.model.acc], feed_dict=feed_dict)
+            loss_list.append(loss)
+            acc_list.append(acc)
+
+            cur_iter = self.model.global_step_tensor.eval(self.sess)
+            if cur_iter % self.config.TCov == 0:
+                self.sess.run([self.model.cov_update_op], feed_dict=feed_dict)
+
+            if cur_iter % self.config.TInv == 0:
+                self.sess.run([self.model.inv_update_op, self.model.var_update_op], feed_dict=feed_dict)
+
+        avg_loss = np.mean(loss_list)
+        avg_acc = np.mean(acc_list)
+        self.logger.info("train | loss: %5.4f | accuracy: %5.4f"%(float(avg_loss), float(avg_acc)))
+
+        # summarize
+        summaries_dict = dict()
+        summaries_dict['train_loss'] = avg_loss
+        summaries_dict['train_acc'] = avg_acc
+
+        # summarize
+        cur_iter = self.model.global_step_tensor.eval(self.sess)
+        self.summarizer.summarize(cur_iter, summaries_dict=summaries_dict)
+
+        # self.model.save(self.sess)
+
+    def test_epoch(self):
+        loss_list = []
+        acc_list = []
+        for (x, y) in self.test_loader:
+            feed_dict = {
+                self.model.inputs: x,
+                self.model.targets: y,
+                self.model.is_training: False,
+                self.model.n_particles: self.config.test_particles
+            }
+            loss, acc = self.sess.run([self.model.loss, self.model.acc], feed_dict=feed_dict)
+            loss_list.append(loss)
+            acc_list.append(acc)
+
+        avg_loss = np.mean(loss_list)
+        avg_acc = np.mean(acc_list)
+        self.logger.info("test | loss: %5.4f | accuracy: %5.4f\n"%(float(avg_loss), float(avg_acc)))
+
+        # summarize
+        summaries_dict = dict()
+        summaries_dict['test_loss'] = avg_loss
+        summaries_dict['test_acc'] = avg_acc
+
+        # summarize
+        cur_iter = self.model.global_step_tensor.eval(self.sess)
+        self.summarizer.summarize(cur_iter, summaries_dict=summaries_dict)
+
+TCov: 10
+TInv: 200
+batch_norm: false
+batch_size: 128
+checkpoint_dir: ./experiments/cifar10/noisy-kfac/checkpoint/
+cov_ema_decay: 0.99
+damping: 0.001
+data_aug: false
+data_path: ../data
+dataset: cifar10
+epoch: 150
+eta: 0.1
+exp_name: noisy-kfac
+fisher_approx: kron
+kl: 0.5
+kl_clip: 0.001
+learning_rate: 0.0001
+max_to_keep: 3
+model_name: vgg16
+momentum: 0.9
+num_workers: 2
+optimizer: kfac
+summary_dir: ./experiments/cifar10/noisy-kfac/summary/
+test_batch_size: 100
+test_particles: 10
+train_particles: 1
+
+epoch: 0
+train | loss: 2.3006 | accuracy: 0.1011
+test | loss: 2.2995 | accuracy: 0.1053
+
+epoch: 1
+train | loss: 2.2981 | accuracy: 0.1171
+test | loss: 2.2968 | accuracy: 0.1316
+
+epoch: 2
+train | loss: 2.2945 | accuracy: 0.1455
+test | loss: 2.2918 | accuracy: 0.1797
+
+epoch: 3
+train | loss: 2.2868 | accuracy: 0.1814
+test | loss: 2.2791 | accuracy: 0.2230
+
+epoch: 4
+train | loss: 2.2583 | accuracy: 0.2129
+test | loss: 2.2169 | accuracy: 0.2285
+
+epoch: 5
+train | loss: 2.1299 | accuracy: 0.2268
+test | loss: 2.0384 | accuracy: 0.2555
+
+epoch: 6
+train | loss: 1.9569 | accuracy: 0.2644
+test | loss: 1.9003 | accuracy: 0.3135
+
+epoch: 7
+train | loss: 1.8657 | accuracy: 0.2889
+test | loss: 1.8503 | accuracy: 0.3361
+
+epoch: 8
+train | loss: 1.8371 | accuracy: 0.2998
+test | loss: 1.8569 | accuracy: 0.3512
+
+epoch: 9
+train | loss: 1.8107 | accuracy: 0.3103
+test | loss: 1.8338 | accuracy: 0.3749
+
+epoch: 10
+train | loss: 1.7615 | accuracy: 0.3348
+test | loss: 1.7933 | accuracy: 0.3995
+
+epoch: 11
+train | loss: 1.7010 | accuracy: 0.3645
+test | loss: 1.7587 | accuracy: 0.4147
+
+epoch: 12
+train | loss: 1.6508 | accuracy: 0.3868
+test | loss: 1.7345 | accuracy: 0.4248
+
+epoch: 13
+train | loss: 1.6161 | accuracy: 0.4020
+test | loss: 1.7170 | accuracy: 0.4352
+
+epoch: 14
+train | loss: 1.5634 | accuracy: 0.4186
+test | loss: 1.7048 | accuracy: 0.4434
+
+epoch: 15
+train | loss: 1.5302 | accuracy: 0.4301
+test | loss: 1.6936 | accuracy: 0.4477
+
+epoch: 16
+train | loss: 1.4932 | accuracy: 0.4449
+test | loss: 1.6933 | accuracy: 0.4546
+
+epoch: 17
+train | loss: 1.4648 | accuracy: 0.4590
+test | loss: 1.6870 | accuracy: 0.4582
+
+epoch: 18
+train | loss: 1.4276 | accuracy: 0.4713
+test | loss: 1.6771 | accuracy: 0.4665
+
+epoch: 19
+train | loss: 1.3973 | accuracy: 0.4840
+test | loss: 1.6803 | accuracy: 0.4708
+
+epoch: 20
+train | loss: 1.3642 | accuracy: 0.4960
+test | loss: 1.6789 | accuracy: 0.4713
+
+epoch: 21
+train | loss: 1.3404 | accuracy: 0.5067
+test | loss: 1.6806 | accuracy: 0.4759
+
+epoch: 22
+train | loss: 1.3042 | accuracy: 0.5177
+test | loss: 1.6793 | accuracy: 0.4819
+
+epoch: 23
+train | loss: 1.2673 | accuracy: 0.5325
+test | loss: 1.6895 | accuracy: 0.4848
+
+epoch: 24
+train | loss: 1.2359 | accuracy: 0.5421
+test | loss: 1.6904 | accuracy: 0.4870
+
+epoch: 25
+train | loss: 1.2131 | accuracy: 0.5556
+test | loss: 1.6921 | accuracy: 0.4879
+
+epoch: 26
+train | loss: 1.1969 | accuracy: 0.5594
+test | loss: 1.7067 | accuracy: 0.4913
+
+epoch: 27
+train | loss: 1.1688 | accuracy: 0.5694
+test | loss: 1.7141 | accuracy: 0.4941
+
+epoch: 28
+train | loss: 1.1444 | accuracy: 0.5791
+test | loss: 1.7159 | accuracy: 0.4896
+
+epoch: 29
+train | loss: 1.1175 | accuracy: 0.5862
+test | loss: 1.7250 | accuracy: 0.4984
+
+epoch: 30
+train | loss: 1.0932 | accuracy: 0.5947
+test | loss: 1.7276 | accuracy: 0.5010
+
+epoch: 31
+train | loss: 1.0781 | accuracy: 0.6033
+test | loss: 1.7399 | accuracy: 0.5019
+
+epoch: 32
+train | loss: 1.0594 | accuracy: 0.6104
+test | loss: 1.7500 | accuracy: 0.5060
+
+epoch: 33
+train | loss: 1.0271 | accuracy: 0.6211
+test | loss: 1.7608 | accuracy: 0.5074
+
+epoch: 34
+train | loss: 1.0147 | accuracy: 0.6236
+test | loss: 1.7536 | accuracy: 0.5089
+
+epoch: 35
+train | loss: 0.9956 | accuracy: 0.6343
+test | loss: 1.7658 | accuracy: 0.5084
+
+epoch: 36
+train | loss: 0.9784 | accuracy: 0.6385
+test | loss: 1.7866 | accuracy: 0.5101
+
+epoch: 37
+train | loss: 0.9528 | accuracy: 0.6478
+test | loss: 1.7892 | accuracy: 0.5137
+
+epoch: 38
+train | loss: 0.9364 | accuracy: 0.6550
+test | loss: 1.8005 | accuracy: 0.5121
+
+epoch: 39
+train | loss: 0.9124 | accuracy: 0.6604
+test | loss: 1.7932 | accuracy: 0.5105
+
+epoch: 40
+train | loss: 0.9016 | accuracy: 0.6669
+test | loss: 1.8230 | accuracy: 0.5139
+
+epoch: 41
+train | loss: 0.9009 | accuracy: 0.6691
+test | loss: 1.8252 | accuracy: 0.5173
+
+epoch: 42
+train | loss: 0.8723 | accuracy: 0.6771
+test | loss: 1.8392 | accuracy: 0.5118
+
+epoch: 43
+train | loss: 0.8629 | accuracy: 0.6820
+test | loss: 1.8596 | accuracy: 0.5138
+
+epoch: 44
+train | loss: 0.8493 | accuracy: 0.6874
+test | loss: 1.8616 | accuracy: 0.5132
+
+epoch: 45
+train | loss: 0.8312 | accuracy: 0.6908
+test | loss: 1.8683 | accuracy: 0.5157
+
+epoch: 46
+train | loss: 0.8196 | accuracy: 0.6968
+test | loss: 1.8716 | accuracy: 0.5186
+
+epoch: 47
+train | loss: 0.8160 | accuracy: 0.6962
+test | loss: 1.9006 | accuracy: 0.5187
+
+epoch: 48
+train | loss: 0.7865 | accuracy: 0.7083
+test | loss: 1.9045 | accuracy: 0.5207
+
+epoch: 49
+train | loss: 0.7869 | accuracy: 0.7111
+test | loss: 1.9241 | accuracy: 0.5205
+
+epoch: 50
+train | loss: 0.7863 | accuracy: 0.7106
+test | loss: 1.9267 | accuracy: 0.5206
+
+epoch: 51
+train | loss: 0.7730 | accuracy: 0.7134
+test | loss: 1.9371 | accuracy: 0.5205
+
+epoch: 52
+train | loss: 0.7598 | accuracy: 0.7191
+test | loss: 1.9440 | accuracy: 0.5195
+
+epoch: 53
+train | loss: 0.7455 | accuracy: 0.7252
+test | loss: 1.9502 | accuracy: 0.5192
+
+epoch: 54
+train | loss: 0.7378 | accuracy: 0.7274
+test | loss: 1.9511 | accuracy: 0.5199
+
+epoch: 55
+train | loss: 0.7284 | accuracy: 0.7297
+test | loss: 1.9440 | accuracy: 0.5270
+
+epoch: 56
+train | loss: 0.7246 | accuracy: 0.7330
+test | loss: 1.9515 | accuracy: 0.5273
+
+epoch: 57
+train | loss: 0.7056 | accuracy: 0.7414
+test | loss: 1.9811 | accuracy: 0.5288
+
+epoch: 58
+train | loss: 0.7150 | accuracy: 0.7386
+test | loss: 1.9894 | accuracy: 0.5290
+
+epoch: 59
+train | loss: 0.6986 | accuracy: 0.7435
+test | loss: 1.9959 | accuracy: 0.5275
+
+epoch: 60
+train | loss: 0.6955 | accuracy: 0.7420
+test | loss: 2.0022 | accuracy: 0.5261
+
+epoch: 61
+train | loss: 0.6910 | accuracy: 0.7465
+test | loss: 1.9947 | accuracy: 0.5283
+
+epoch: 62
+train | loss: 0.6730 | accuracy: 0.7516
+test | loss: 2.0163 | accuracy: 0.5286
+
+epoch: 63
+train | loss: 0.6708 | accuracy: 0.7545
+test | loss: 2.0158 | accuracy: 0.5310
+
+epoch: 64
+train | loss: 0.6634 | accuracy: 0.7558
+test | loss: 2.0467 | accuracy: 0.5276
+
+epoch: 65
+train | loss: 0.6508 | accuracy: 0.7619
+test | loss: 2.0304 | accuracy: 0.5343
+
+epoch: 66
+train | loss: 0.6435 | accuracy: 0.7645
+test | loss: 2.0621 | accuracy: 0.5317
+
+epoch: 67
+train | loss: 0.6428 | accuracy: 0.7655
+test | loss: 2.0617 | accuracy: 0.5302
+
+epoch: 68
+train | loss: 0.6405 | accuracy: 0.7646
+test | loss: 2.0774 | accuracy: 0.5322
+
+epoch: 69
+train | loss: 0.6275 | accuracy: 0.7706
+test | loss: 2.0944 | accuracy: 0.5346
+
+epoch: 70
+train | loss: 0.6255 | accuracy: 0.7732
+test | loss: 2.0963 | accuracy: 0.5355
+
+epoch: 71
+train | loss: 0.6085 | accuracy: 0.7780
+test | loss: 2.1190 | accuracy: 0.5286
+
+epoch: 72
+train | loss: 0.6047 | accuracy: 0.7775
+test | loss: 2.1253 | accuracy: 0.5352
+
+epoch: 73
+train | loss: 0.5945 | accuracy: 0.7852
+test | loss: 2.1562 | accuracy: 0.5364
+
+epoch: 74
+train | loss: 0.5891 | accuracy: 0.7857
+test | loss: 2.1324 | accuracy: 0.5357
+
+epoch: 75
+train | loss: 0.5915 | accuracy: 0.7836
+test | loss: 2.1720 | accuracy: 0.5335
+
+epoch: 76
+train | loss: 0.5924 | accuracy: 0.7865
+test | loss: 2.1486 | accuracy: 0.5334
+
+epoch: 77
+train | loss: 0.5733 | accuracy: 0.7919
+test | loss: 2.1693 | accuracy: 0.5388
+
+epoch: 78
+train | loss: 0.5803 | accuracy: 0.7888
+test | loss: 2.1807 | accuracy: 0.5354
+
+epoch: 79
+train | loss: 0.5718 | accuracy: 0.7939
+test | loss: 2.1895 | accuracy: 0.5355
+
+epoch: 80
+train | loss: 0.5669 | accuracy: 0.7957
+test | loss: 2.1999 | accuracy: 0.5412
+
+epoch: 81
+train | loss: 0.5629 | accuracy: 0.7949
+test | loss: 2.1891 | accuracy: 0.5344
+
+epoch: 82
+train | loss: 0.5515 | accuracy: 0.7988
+test | loss: 2.2027 | accuracy: 0.5399
+
+epoch: 83
+train | loss: 0.5530 | accuracy: 0.7995
+test | loss: 2.2073 | accuracy: 0.5376
+
+epoch: 84
+train | loss: 0.5444 | accuracy: 0.8032
+test | loss: 2.2518 | accuracy: 0.5349
+
+epoch: 85
+train | loss: 0.5408 | accuracy: 0.8039
+test | loss: 2.2241 | accuracy: 0.5400
+
+epoch: 86
+train | loss: 0.5367 | accuracy: 0.8081
+test | loss: 2.2323 | accuracy: 0.5412
+
+epoch: 87
+train | loss: 0.5310 | accuracy: 0.8060
+test | loss: 2.2340 | accuracy: 0.5403
+
+epoch: 88
+train | loss: 0.5357 | accuracy: 0.8059
+test | loss: 2.2486 | accuracy: 0.5412
+
+epoch: 89
+train | loss: 0.5264 | accuracy: 0.8103
+test | loss: 2.2532 | accuracy: 0.5438
+
+epoch: 90
+train | loss: 0.5180 | accuracy: 0.8136
+test | loss: 2.2757 | accuracy: 0.5378
+
+epoch: 91
+train | loss: 0.5281 | accuracy: 0.8123
+test | loss: 2.2784 | accuracy: 0.5394
+
+epoch: 92
+train | loss: 0.5184 | accuracy: 0.8133
+test | loss: 2.2783 | accuracy: 0.5458
+
+epoch: 93
+train | loss: 0.5129 | accuracy: 0.8171
+test | loss: 2.2919 | accuracy: 0.5397
+
+epoch: 94
+train | loss: 0.5101 | accuracy: 0.8184
+test | loss: 2.2988 | accuracy: 0.5369
+
+epoch: 95
+train | loss: 0.5035 | accuracy: 0.8205
+test | loss: 2.3300 | accuracy: 0.5439
+
+epoch: 96
+train | loss: 0.4966 | accuracy: 0.8211
+test | loss: 2.3289 | accuracy: 0.5470
+
+epoch: 97
+train | loss: 0.5063 | accuracy: 0.8182
+test | loss: 2.3052 | accuracy: 0.5478
+
+epoch: 98
+train | loss: 0.4878 | accuracy: 0.8256
+test | loss: 2.3284 | accuracy: 0.5449
+
+epoch: 99
+train | loss: 0.4859 | accuracy: 0.8259
+test | loss: 2.3115 | accuracy: 0.5430
+
+epoch: 100
+train | loss: 0.4879 | accuracy: 0.8276
+test | loss: 2.3267 | accuracy: 0.5428
+
+epoch: 101
+train | loss: 0.4827 | accuracy: 0.8270
+test | loss: 2.3330 | accuracy: 0.5451
+
+epoch: 102
+train | loss: 0.4867 | accuracy: 0.8257
+test | loss: 2.3423 | accuracy: 0.5457
+
+epoch: 103
+train | loss: 0.4792 | accuracy: 0.8296
+test | loss: 2.3667 | accuracy: 0.5450
+
+epoch: 104
+train | loss: 0.4778 | accuracy: 0.8295
+test | loss: 2.3598 | accuracy: 0.5465
+
+epoch: 105
+train | loss: 0.4768 | accuracy: 0.8309
+test | loss: 2.3855 | accuracy: 0.5460
+
+epoch: 106
+train | loss: 0.4813 | accuracy: 0.8298
+test | loss: 2.3825 | accuracy: 0.5496
+
+epoch: 107
+train | loss: 0.4735 | accuracy: 0.8312
+test | loss: 2.3648 | accuracy: 0.5461
+
+epoch: 108
+train | loss: 0.4791 | accuracy: 0.8292
+test | loss: 2.4016 | accuracy: 0.5462
+
+epoch: 109
+train | loss: 0.4768 | accuracy: 0.8297
+test | loss: 2.4032 | accuracy: 0.5485
+
+epoch: 110
+train | loss: 0.4654 | accuracy: 0.8350
+test | loss: 2.3929 | accuracy: 0.5467
+
+epoch: 111
+train | loss: 0.4582 | accuracy: 0.8371
+test | loss: 2.4038 | accuracy: 0.5452
+
+epoch: 112
+train | loss: 0.4572 | accuracy: 0.8380
+test | loss: 2.3934 | accuracy: 0.5493
+
+epoch: 113
+train | loss: 0.4624 | accuracy: 0.8373
+test | loss: 2.4053 | accuracy: 0.5437
+
+epoch: 114
+train | loss: 0.4562 | accuracy: 0.8358
+test | loss: 2.4211 | accuracy: 0.5455
+
+epoch: 115
+train | loss: 0.4575 | accuracy: 0.8363
+test | loss: 2.4370 | accuracy: 0.5456
+
+epoch: 116
+train | loss: 0.4554 | accuracy: 0.8373
+test | loss: 2.4146 | accuracy: 0.5398
+
+epoch: 117
+train | loss: 0.4532 | accuracy: 0.8391
+test | loss: 2.4169 | accuracy: 0.5458
+
+epoch: 118
+train | loss: 0.4512 | accuracy: 0.8392
+test | loss: 2.4217 | accuracy: 0.5464
+
+epoch: 119
+train | loss: 0.4525 | accuracy: 0.8394
+test | loss: 2.4306 | accuracy: 0.5515
+
+epoch: 120
+train | loss: 0.4556 | accuracy: 0.8387
+test | loss: 2.4226 | accuracy: 0.5470
+
+epoch: 121
+train | loss: 0.4481 | accuracy: 0.8415
+test | loss: 2.4231 | accuracy: 0.5472
+
+epoch: 122
+train | loss: 0.4415 | accuracy: 0.8450
+test | loss: 2.4268 | accuracy: 0.5478
+
+epoch: 123
+train | loss: 0.4524 | accuracy: 0.8386
+test | loss: 2.4334 | accuracy: 0.5496
+
+epoch: 124
+train | loss: 0.4427 | accuracy: 0.8424
+test | loss: 2.4632 | accuracy: 0.5503
+
+epoch: 125
+train | loss: 0.4490 | accuracy: 0.8413
+test | loss: 2.4401 | accuracy: 0.5532
+
+epoch: 126
+train | loss: 0.4442 | accuracy: 0.8451
+test | loss: 2.4610 | accuracy: 0.5499
+
+epoch: 127
+train | loss: 0.4443 | accuracy: 0.8431
+test | loss: 2.4554 | accuracy: 0.5449
+
+epoch: 128
+train | loss: 0.4513 | accuracy: 0.8425
+test | loss: 2.4571 | accuracy: 0.5459
+
+epoch: 129
+train | loss: 0.4422 | accuracy: 0.8439
+test | loss: 2.4661 | accuracy: 0.5462
+
+epoch: 130
+train | loss: 0.4509 | accuracy: 0.8412
+test | loss: 2.4509 | accuracy: 0.5465
+
+epoch: 131
+train | loss: 0.4420 | accuracy: 0.8439
+test | loss: 2.4635 | accuracy: 0.5523
+
+epoch: 132
+train | loss: 0.4447 | accuracy: 0.8427
+test | loss: 2.4394 | accuracy: 0.5543
+
+epoch: 133
+train | loss: 0.4330 | accuracy: 0.8475
+test | loss: 2.4576 | accuracy: 0.5469
+
+epoch: 134
+train | loss: 0.4332 | accuracy: 0.8467
+test | loss: 2.4590 | accuracy: 0.5458
+
+epoch: 135
+train | loss: 0.4399 | accuracy: 0.8446
+test | loss: 2.4805 | accuracy: 0.5464
+
+epoch: 136
+train | loss: 0.4342 | accuracy: 0.8464
+test | loss: 2.4765 | accuracy: 0.5444
+
+epoch: 137
+train | loss: 0.4254 | accuracy: 0.8499
+test | loss: 2.4751 | accuracy: 0.5511
+
+epoch: 138
+train | loss: 0.4201 | accuracy: 0.8533
+test | loss: 2.4745 | accuracy: 0.5511
+
+epoch: 139
+train | loss: 0.4403 | accuracy: 0.8468
+test | loss: 2.4835 | accuracy: 0.5502
+
+epoch: 140
+train | loss: 0.4314 | accuracy: 0.8476
+test | loss: 2.4610 | accuracy: 0.5502
+
+epoch: 141
+train | loss: 0.4328 | accuracy: 0.8481
+test | loss: 2.4788 | accuracy: 0.5516
+
+epoch: 142
+train | loss: 0.4412 | accuracy: 0.8450
+test | loss: 2.4681 | accuracy: 0.5468
+
+epoch: 143
+train | loss: 0.4383 | accuracy: 0.8459
+test | loss: 2.4665 | accuracy: 0.5505
+
+epoch: 144
+train | loss: 0.4274 | accuracy: 0.8491
+test | loss: 2.4958 | accuracy: 0.5505
+
+epoch: 145
+train | loss: 0.4292 | accuracy: 0.8498
+test | loss: 2.4686 | accuracy: 0.5535
+
+epoch: 146
+train | loss: 0.4281 | accuracy: 0.8497
+test | loss: 2.4945 | accuracy: 0.5469
+
+epoch: 147
+train | loss: 0.4307 | accuracy: 0.8484
+test | loss: 2.4903 | accuracy: 0.5517
+
+epoch: 148
+train | loss: 0.4219 | accuracy: 0.8521
+test | loss: 2.4828 | accuracy: 0.5481
+
+epoch: 149
+train | loss: 0.4097 | accuracy: 0.8567
+test | loss: 2.4824 | accuracy: 0.5526
+

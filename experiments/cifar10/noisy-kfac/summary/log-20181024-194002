@@ -1,0 +1,1499 @@
+/h/minfanzh/noisy-K-FAC_use_all_FC/main.py
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import tensorflow as tf
+import numpy as np
+import os
+
+from misc.utils import get_logger, get_args, makedirs
+from misc.config import process_config
+from misc.data_loader import load_pytorch
+from core.model import Model
+from core.train import Trainer
+
+
+_INPUT_DIM = {
+    'fmnist': [784],
+    'mnist': [784],
+    'cifar10': [32, 32, 3],
+    'cifar100': [32, 32, 3]
+}
+
+
+def main():
+    tf.set_random_seed(1231)
+    np.random.seed(1231)
+
+    try:
+        args = get_args()
+        config = process_config(args.config)
+    except:
+        print("Add a config file using \'--config file_name.json\'")
+        exit(1)
+
+    makedirs(config.summary_dir)
+    makedirs(config.checkpoint_dir)
+
+    # set logger
+    path = os.path.dirname(os.path.abspath(__file__))
+    path1 = os.path.join(path, 'core/model.py')
+    path2 = os.path.join(path, 'core/train.py')
+    logger = get_logger('log', logpath=config.summary_dir+'/',
+                        filepath=os.path.abspath(__file__), package_files=[path1, path2])
+
+    logger.info(config)
+
+    # load data
+    train_loader, test_loader = load_pytorch(config)
+
+    # define computational graph
+    sess = tf.Session()
+
+    model_ = Model(config, _INPUT_DIM[config.dataset], len(train_loader.dataset))
+    trainer = Trainer(sess, model_, train_loader, test_loader, config, logger)
+
+    trainer.train()
+
+
+if __name__ == "__main__":
+    main()
+
+/h/minfanzh/noisy-K-FAC_use_all_FC/core/model.py
+import tensorflow as tf
+
+from ops import optimizer as opt
+from ops import layer_collection as lc
+from ops import sampler as sp
+from network.registry import get_model
+from core.base_model import BaseModel
+
+
+class Model(BaseModel):
+    def __init__(self, config, input_dim, n_data):
+        super().__init__(config)
+        self.layer_collection = lc.LayerCollection()
+        self.input_dim = input_dim
+        self.n_data = n_data
+
+        self.cov_update_op = None
+        self.inv_update_op = None
+
+        self.build_model()
+        self.init_optim()
+        self.init_saver()
+
+    @property
+    def trainable_variables(self):
+        # note: we don't train the params of BN
+        vars = []
+        for var in tf.trainable_variables():
+            if "w" in var.name:
+                vars.append(var)
+        return vars
+
+    def build_model(self):
+        self.inputs = tf.placeholder(tf.float32, [None] + self.input_dim)
+        self.targets = tf.placeholder(tf.int64, [None])
+        self.is_training = tf.placeholder(tf.bool)
+        self.n_particles = tf.placeholder(tf.int32)
+
+        inputs = self.inputs
+        net = get_model(self.config.model_name)
+
+        self.sampler = sp.Sampler(self.config, self.n_data, self.n_particles)
+        logits, l2_loss = net(inputs, self.sampler, self.is_training,
+                              self.config.batch_norm, self.layer_collection,
+                              self.n_particles)
+
+        # ensemble
+        logits_ = tf.reduce_mean(
+            tf.reshape(logits, [self.n_particles, -1, tf.shape(logits)[-1]]), 0)
+        self.acc = tf.reduce_mean(tf.cast(tf.equal(
+            self.targets, tf.argmax(logits_, axis=1)), dtype=tf.float32))
+
+        targets_ = tf.tile(self.targets, [self.n_particles])
+        self.loss = tf.reduce_mean(
+            tf.nn.sparse_softmax_cross_entropy_with_logits(
+                labels=targets_, logits=logits))
+
+        coeff = self.config.kl / (self.n_data * self.config.eta)
+        self.total_loss = self.loss + coeff * l2_loss
+
+    def init_optim(self):
+        self.optim = opt.KFACOptimizer(var_list=self.trainable_variables,
+                                       learning_rate=self.config.learning_rate,
+                                       cov_ema_decay=self.config.cov_ema_decay,
+                                       damping=self.config.damping,
+                                       layer_collection=self.layer_collection,
+                                       norm_constraint=tf.train.exponential_decay(self.config.kl_clip,
+                                                                                  self.global_step_tensor,
+                                                                                  390, 0.95, staircase=True),
+                                       momentum=self.config.momentum)
+
+        self.cov_update_op = self.optim.cov_update_op
+        self.inv_update_op = self.optim.inv_update_op
+
+        with tf.control_dependencies([self.inv_update_op]):
+            self.var_update_op = self.sampler.update(self.layer_collection.get_blocks())
+
+        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+        with tf.control_dependencies(update_ops):
+            self.train_op = self.optim.minimize(self.total_loss, global_step=self.global_step_tensor)
+
+    def init_saver(self):
+        self.saver = tf.train.Saver(max_to_keep=self.config.max_to_keep)
+
+
+/h/minfanzh/noisy-K-FAC_use_all_FC/core/train.py
+from core.base_train import BaseTrain
+from tqdm import tqdm
+import numpy as np
+
+import csv
+
+
+class Trainer(BaseTrain):
+    def __init__(self, sess, model, train_loader, test_loader, config, logger):
+        super(Trainer, self).__init__(sess, model, config, logger)
+        self.train_loader = train_loader
+        self.test_loader = test_loader
+
+    def train(self):
+        for cur_epoch in range(self.config.epoch):
+            self.logger.info('epoch: {}'.format(int(cur_epoch)))
+            self.train_epoch()
+            self.test_epoch()
+
+    def train_epoch(self):
+        loss_list = []
+        acc_list = []
+        store_csv_data = []
+        for itr, (x, y) in enumerate(tqdm(self.train_loader)):
+            feed_dict = {
+                self.model.inputs: x,
+                self.model.targets: y,
+                self.model.n_particles: self.config.train_particles
+            }
+            if itr % 20 == 0:
+                acc_test_list = []
+                for (x1, y1) in self.test_loader:
+                    feed_dict_test = {
+                        self.model.inputs: x1,
+                        self.model.targets: y1,
+                        self.model.is_training: False,
+                        self.model.n_particles: self.config.test_particles
+                    }
+                    acc_test = self.sess.run([self.model.acc], feed_dict=feed_dict_test)
+
+                    acc_test_list.append(acc_test)                
+
+                avg_test_acc = np.mean(acc_test_list)
+                self.logger.info("itr %d : test accuracy: %5.4f\n"%(itr, float(avg_test_acc)))
+                store_csv_data.append([float(avg_test_acc)])
+
+            feed_dict.update({self.model.is_training: True})
+            self.sess.run([self.model.train_op], feed_dict=feed_dict)
+
+            feed_dict.update({self.model.is_training: False})  # note: that's important
+            loss, acc = self.sess.run([self.model.loss, self.model.acc], feed_dict=feed_dict)
+            loss_list.append(loss)
+            acc_list.append(acc)
+
+            cur_iter = self.model.global_step_tensor.eval(self.sess)
+            if cur_iter % self.config.TCov == 0:
+                self.sess.run([self.model.cov_update_op], feed_dict=feed_dict)
+
+            if cur_iter % self.config.TInv == 0:
+                self.sess.run([self.model.inv_update_op, self.model.var_update_op], feed_dict=feed_dict)
+
+        storeFile = open('data_bs_cifar_128.csv', 'a')
+        with storeFile :
+            writer = csv.writer(storeFile)
+            writer.writerows(store_csv_data)
+
+        avg_loss = np.mean(loss_list)
+        avg_acc = np.mean(acc_list)
+        self.logger.info("train | loss: %5.4f | accuracy: %5.4f"%(float(avg_loss), float(avg_acc)))
+
+        # summarize
+        summaries_dict = dict()
+        summaries_dict['train_loss'] = avg_loss
+        summaries_dict['train_acc'] = avg_acc
+
+        # summarize
+        cur_iter = self.model.global_step_tensor.eval(self.sess)
+        self.summarizer.summarize(cur_iter, summaries_dict=summaries_dict)
+
+        # self.model.save(self.sess)
+
+    def test_epoch(self):
+        loss_list = []
+        acc_list = []
+        for (x, y) in self.test_loader:
+            feed_dict = {
+                self.model.inputs: x,
+                self.model.targets: y,
+                self.model.is_training: False,
+                self.model.n_particles: self.config.test_particles
+            }
+            loss, acc = self.sess.run([self.model.loss, self.model.acc], feed_dict=feed_dict)
+            loss_list.append(loss)
+            acc_list.append(acc)
+
+        avg_loss = np.mean(loss_list)
+        avg_acc = np.mean(acc_list)
+        self.logger.info("test | loss: %5.4f | accuracy: %5.4f\n"%(float(avg_loss), float(avg_acc)))
+
+        # summarize
+        summaries_dict = dict()
+        summaries_dict['test_loss'] = avg_loss
+        summaries_dict['test_acc'] = avg_acc
+
+        # summarize
+        cur_iter = self.model.global_step_tensor.eval(self.sess)
+        self.summarizer.summarize(cur_iter, summaries_dict=summaries_dict)
+
+TCov: 10
+TInv: 200
+batch_norm: false
+batch_size: 128
+checkpoint_dir: ./experiments/cifar10/noisy-kfac/checkpoint/
+cov_ema_decay: 0.99
+damping: 0.001
+data_aug: false
+data_path: ../data
+dataset: cifar10
+epoch: 150
+eta: 0.1
+exp_name: noisy-kfac
+fisher_approx: kron
+kl: 0.5
+kl_clip: 0.001
+learning_rate: 0.0001
+max_to_keep: 3
+model_name: vgg16
+momentum: 0.9
+num_workers: 2
+optimizer: kfac
+summary_dir: ./experiments/cifar10/noisy-kfac/summary/
+test_batch_size: 100
+test_particles: 1
+train_particles: 1
+
+epoch: 0
+itr 0 : test accuracy: 0.0997
+
+itr 20 : test accuracy: 0.0995
+
+itr 40 : test accuracy: 0.0995
+
+itr 60 : test accuracy: 0.0994
+
+itr 80 : test accuracy: 0.0996
+
+itr 100 : test accuracy: 0.0997
+
+itr 120 : test accuracy: 0.1000
+
+itr 140 : test accuracy: 0.0998
+
+itr 160 : test accuracy: 0.0995
+
+itr 180 : test accuracy: 0.1004
+
+itr 200 : test accuracy: 0.1012
+
+itr 220 : test accuracy: 0.0993
+
+itr 240 : test accuracy: 0.1013
+
+itr 260 : test accuracy: 0.1011
+
+itr 280 : test accuracy: 0.1013
+
+itr 300 : test accuracy: 0.1009
+
+itr 320 : test accuracy: 0.1017
+
+itr 340 : test accuracy: 0.1002
+
+itr 360 : test accuracy: 0.0998
+
+itr 380 : test accuracy: 0.1025
+
+train | loss: 2.3042 | accuracy: 0.1005
+test | loss: 2.3032 | accuracy: 0.1015
+
+epoch: 1
+itr 0 : test accuracy: 0.1019
+
+itr 20 : test accuracy: 0.1028
+
+itr 40 : test accuracy: 0.1016
+
+itr 60 : test accuracy: 0.1042
+
+itr 80 : test accuracy: 0.1041
+
+itr 100 : test accuracy: 0.1037
+
+itr 120 : test accuracy: 0.1044
+
+itr 140 : test accuracy: 0.1085
+
+itr 160 : test accuracy: 0.1089
+
+itr 180 : test accuracy: 0.1091
+
+itr 200 : test accuracy: 0.1102
+
+itr 220 : test accuracy: 0.1076
+
+itr 240 : test accuracy: 0.1092
+
+itr 260 : test accuracy: 0.1105
+
+itr 280 : test accuracy: 0.1128
+
+itr 300 : test accuracy: 0.1110
+
+itr 320 : test accuracy: 0.1143
+
+itr 340 : test accuracy: 0.1143
+
+itr 360 : test accuracy: 0.1188
+
+itr 380 : test accuracy: 0.1217
+
+train | loss: 2.3020 | accuracy: 0.1097
+test | loss: 2.3011 | accuracy: 0.1212
+
+epoch: 2
+itr 0 : test accuracy: 0.1189
+
+itr 20 : test accuracy: 0.1178
+
+itr 40 : test accuracy: 0.1234
+
+itr 60 : test accuracy: 0.1185
+
+itr 80 : test accuracy: 0.1209
+
+itr 100 : test accuracy: 0.1248
+
+itr 120 : test accuracy: 0.1263
+
+itr 140 : test accuracy: 0.1271
+
+itr 160 : test accuracy: 0.1288
+
+itr 180 : test accuracy: 0.1277
+
+itr 200 : test accuracy: 0.1281
+
+itr 220 : test accuracy: 0.1301
+
+itr 240 : test accuracy: 0.1287
+
+itr 260 : test accuracy: 0.1343
+
+itr 280 : test accuracy: 0.1349
+
+itr 300 : test accuracy: 0.1407
+
+itr 320 : test accuracy: 0.1420
+
+itr 340 : test accuracy: 0.1430
+
+itr 360 : test accuracy: 0.1385
+
+itr 380 : test accuracy: 0.1420
+
+train | loss: 2.2994 | accuracy: 0.1284
+test | loss: 2.2974 | accuracy: 0.1441
+
+epoch: 3
+itr 0 : test accuracy: 0.1419
+
+itr 20 : test accuracy: 0.1447
+
+itr 40 : test accuracy: 0.1422
+
+itr 60 : test accuracy: 0.1486
+
+itr 80 : test accuracy: 0.1453
+
+itr 100 : test accuracy: 0.1448
+
+itr 120 : test accuracy: 0.1539
+
+itr 140 : test accuracy: 0.1469
+
+itr 160 : test accuracy: 0.1549
+
+itr 180 : test accuracy: 0.1567
+
+itr 200 : test accuracy: 0.1585
+
+itr 220 : test accuracy: 0.1605
+
+itr 240 : test accuracy: 0.1580
+
+itr 260 : test accuracy: 0.1551
+
+itr 280 : test accuracy: 0.1636
+
+itr 300 : test accuracy: 0.1656
+
+itr 320 : test accuracy: 0.1698
+
+itr 340 : test accuracy: 0.1675
+
+itr 360 : test accuracy: 0.1697
+
+itr 380 : test accuracy: 0.1723
+
+train | loss: 2.2950 | accuracy: 0.1531
+test | loss: 2.2911 | accuracy: 0.1752
+
+epoch: 4
+itr 0 : test accuracy: 0.1717
+
+itr 20 : test accuracy: 0.1791
+
+itr 40 : test accuracy: 0.1689
+
+itr 60 : test accuracy: 0.1727
+
+itr 80 : test accuracy: 0.1728
+
+itr 100 : test accuracy: 0.1775
+
+itr 120 : test accuracy: 0.1797
+
+itr 140 : test accuracy: 0.1877
+
+itr 160 : test accuracy: 0.1846
+
+itr 180 : test accuracy: 0.1909
+
+itr 200 : test accuracy: 0.1827
+
+itr 220 : test accuracy: 0.1894
+
+itr 240 : test accuracy: 0.1795
+
+itr 260 : test accuracy: 0.1904
+
+itr 280 : test accuracy: 0.1898
+
+itr 300 : test accuracy: 0.1968
+
+itr 320 : test accuracy: 0.1897
+
+itr 340 : test accuracy: 0.2042
+
+itr 360 : test accuracy: 0.2077
+
+itr 380 : test accuracy: 0.2027
+
+train | loss: 2.2843 | accuracy: 0.1836
+test | loss: 2.2705 | accuracy: 0.2077
+
+epoch: 5
+itr 0 : test accuracy: 0.2013
+
+itr 20 : test accuracy: 0.2106
+
+itr 40 : test accuracy: 0.2133
+
+itr 60 : test accuracy: 0.2011
+
+itr 80 : test accuracy: 0.2052
+
+itr 100 : test accuracy: 0.2025
+
+itr 120 : test accuracy: 0.2089
+
+itr 140 : test accuracy: 0.2083
+
+itr 160 : test accuracy: 0.2120
+
+itr 180 : test accuracy: 0.2131
+
+itr 200 : test accuracy: 0.2186
+
+itr 220 : test accuracy: 0.2152
+
+itr 240 : test accuracy: 0.2159
+
+itr 260 : test accuracy: 0.2028
+
+itr 280 : test accuracy: 0.2076
+
+itr 300 : test accuracy: 0.2116
+
+itr 320 : test accuracy: 0.2196
+
+itr 340 : test accuracy: 0.2187
+
+itr 360 : test accuracy: 0.2172
+
+itr 380 : test accuracy: 0.2271
+
+train | loss: 2.2215 | accuracy: 0.2094
+test | loss: 2.1396 | accuracy: 0.2211
+
+epoch: 6
+itr 0 : test accuracy: 0.2224
+
+itr 20 : test accuracy: 0.2335
+
+itr 40 : test accuracy: 0.2310
+
+itr 60 : test accuracy: 0.2257
+
+itr 80 : test accuracy: 0.2284
+
+itr 100 : test accuracy: 0.2394
+
+itr 120 : test accuracy: 0.2403
+
+itr 140 : test accuracy: 0.2413
+
+itr 160 : test accuracy: 0.2402
+
+itr 180 : test accuracy: 0.2428
+
+itr 200 : test accuracy: 0.2448
+
+itr 220 : test accuracy: 0.2498
+
+itr 240 : test accuracy: 0.2493
+
+itr 260 : test accuracy: 0.2529
+
+itr 280 : test accuracy: 0.2494
+
+itr 300 : test accuracy: 0.2619
+
+itr 320 : test accuracy: 0.2659
+
+itr 340 : test accuracy: 0.2628
+
+itr 360 : test accuracy: 0.2690
+
+itr 380 : test accuracy: 0.2664
+
+train | loss: 2.0408 | accuracy: 0.2436
+test | loss: 1.9344 | accuracy: 0.2682
+
+epoch: 7
+itr 0 : test accuracy: 0.2653
+
+itr 20 : test accuracy: 0.2696
+
+itr 40 : test accuracy: 0.2693
+
+itr 60 : test accuracy: 0.2814
+
+itr 80 : test accuracy: 0.2574
+
+itr 100 : test accuracy: 0.2644
+
+itr 120 : test accuracy: 0.2732
+
+itr 140 : test accuracy: 0.2765
+
+itr 160 : test accuracy: 0.2819
+
+itr 180 : test accuracy: 0.2782
+
+itr 200 : test accuracy: 0.2843
+
+itr 220 : test accuracy: 0.2855
+
+itr 240 : test accuracy: 0.2840
+
+itr 260 : test accuracy: 0.2825
+
+itr 280 : test accuracy: 0.2694
+
+itr 300 : test accuracy: 0.2825
+
+itr 320 : test accuracy: 0.2718
+
+itr 340 : test accuracy: 0.2747
+
+itr 360 : test accuracy: 0.2785
+
+itr 380 : test accuracy: 0.2781
+
+train | loss: 1.9214 | accuracy: 0.2717
+test | loss: 1.8965 | accuracy: 0.2829
+
+epoch: 8
+itr 0 : test accuracy: 0.2815
+
+itr 20 : test accuracy: 0.2838
+
+itr 40 : test accuracy: 0.2874
+
+itr 60 : test accuracy: 0.2834
+
+itr 80 : test accuracy: 0.2645
+
+itr 100 : test accuracy: 0.2661
+
+itr 120 : test accuracy: 0.2659
+
+itr 140 : test accuracy: 0.2726
+
+itr 160 : test accuracy: 0.2807
+
+itr 180 : test accuracy: 0.2811
+
+itr 200 : test accuracy: 0.2808
+
+itr 220 : test accuracy: 0.2799
+
+itr 240 : test accuracy: 0.2834
+
+itr 260 : test accuracy: 0.2827
+
+itr 280 : test accuracy: 0.2683
+
+itr 300 : test accuracy: 0.2711
+
+itr 320 : test accuracy: 0.2729
+
+itr 340 : test accuracy: 0.2791
+
+itr 360 : test accuracy: 0.2784
+
+itr 380 : test accuracy: 0.2780
+
+train | loss: 1.9088 | accuracy: 0.2802
+test | loss: 1.9213 | accuracy: 0.2780
+
+epoch: 9
+itr 0 : test accuracy: 0.2813
+
+itr 20 : test accuracy: 0.2889
+
+itr 40 : test accuracy: 0.2840
+
+itr 60 : test accuracy: 0.2893
+
+itr 80 : test accuracy: 0.2890
+
+itr 100 : test accuracy: 0.2775
+
+itr 120 : test accuracy: 0.2741
+
+itr 140 : test accuracy: 0.2763
+
+itr 160 : test accuracy: 0.2793
+
+itr 180 : test accuracy: 0.2849
+
+itr 200 : test accuracy: 0.2769
+
+itr 220 : test accuracy: 0.2822
+
+itr 240 : test accuracy: 0.2933
+
+itr 260 : test accuracy: 0.2876
+
+itr 280 : test accuracy: 0.2862
+
+itr 300 : test accuracy: 0.2875
+
+itr 320 : test accuracy: 0.2847
+
+itr 340 : test accuracy: 0.2883
+
+itr 360 : test accuracy: 0.2865
+
+itr 380 : test accuracy: 0.2906
+
+train | loss: 1.8889 | accuracy: 0.2909
+test | loss: 1.8980 | accuracy: 0.2938
+
+epoch: 10
+itr 0 : test accuracy: 0.2978
+
+itr 20 : test accuracy: 0.2977
+
+itr 40 : test accuracy: 0.2965
+
+itr 60 : test accuracy: 0.3072
+
+itr 80 : test accuracy: 0.3003
+
+itr 100 : test accuracy: 0.2990
+
+itr 120 : test accuracy: 0.2975
+
+itr 140 : test accuracy: 0.3008
+
+itr 160 : test accuracy: 0.3006
+
+itr 180 : test accuracy: 0.3129
+
+itr 200 : test accuracy: 0.3110
+
+itr 220 : test accuracy: 0.3084
+
+itr 240 : test accuracy: 0.3090
+
+itr 260 : test accuracy: 0.3169
+
+itr 280 : test accuracy: 0.3141
+
+itr 300 : test accuracy: 0.3114
+
+itr 320 : test accuracy: 0.3167
+
+itr 340 : test accuracy: 0.3153
+
+itr 360 : test accuracy: 0.3194
+
+itr 380 : test accuracy: 0.3207
+
+train | loss: 1.8398 | accuracy: 0.3148
+test | loss: 1.8452 | accuracy: 0.3209
+
+epoch: 11
+itr 0 : test accuracy: 0.3147
+
+itr 20 : test accuracy: 0.3196
+
+itr 40 : test accuracy: 0.3205
+
+itr 60 : test accuracy: 0.3243
+
+itr 80 : test accuracy: 0.3248
+
+itr 100 : test accuracy: 0.3254
+
+itr 120 : test accuracy: 0.3278
+
+itr 140 : test accuracy: 0.3215
+
+itr 160 : test accuracy: 0.3265
+
+itr 180 : test accuracy: 0.3246
+
+itr 200 : test accuracy: 0.3262
+
+itr 220 : test accuracy: 0.3271
+
+itr 240 : test accuracy: 0.3244
+
+itr 260 : test accuracy: 0.3301
+
+itr 280 : test accuracy: 0.3310
+
+itr 300 : test accuracy: 0.3308
+
+itr 320 : test accuracy: 0.3274
+
+itr 340 : test accuracy: 0.3265
+
+itr 360 : test accuracy: 0.3318
+
+itr 380 : test accuracy: 0.3348
+
+train | loss: 1.7873 | accuracy: 0.3395
+test | loss: 1.8225 | accuracy: 0.3352
+
+epoch: 12
+itr 0 : test accuracy: 0.3293
+
+itr 20 : test accuracy: 0.3356
+
+itr 40 : test accuracy: 0.3360
+
+itr 60 : test accuracy: 0.3309
+
+itr 80 : test accuracy: 0.3380
+
+itr 100 : test accuracy: 0.3441
+
+itr 120 : test accuracy: 0.3314
+
+itr 140 : test accuracy: 0.3443
+
+itr 160 : test accuracy: 0.3351
+
+itr 180 : test accuracy: 0.3406
+
+itr 200 : test accuracy: 0.3449
+
+itr 220 : test accuracy: 0.3371
+
+itr 240 : test accuracy: 0.3384
+
+itr 260 : test accuracy: 0.3409
+
+itr 280 : test accuracy: 0.3476
+
+itr 300 : test accuracy: 0.3455
+
+itr 320 : test accuracy: 0.3370
+
+itr 340 : test accuracy: 0.3420
+
+itr 360 : test accuracy: 0.3389
+
+itr 380 : test accuracy: 0.3364
+
+train | loss: 1.7486 | accuracy: 0.3543
+test | loss: 1.7948 | accuracy: 0.3416
+
+epoch: 13
+itr 0 : test accuracy: 0.3485
+
+itr 20 : test accuracy: 0.3486
+
+itr 40 : test accuracy: 0.3443
+
+itr 60 : test accuracy: 0.3501
+
+itr 80 : test accuracy: 0.3409
+
+itr 100 : test accuracy: 0.3529
+
+itr 120 : test accuracy: 0.3460
+
+itr 140 : test accuracy: 0.3481
+
+itr 160 : test accuracy: 0.3535
+
+itr 180 : test accuracy: 0.3529
+
+itr 200 : test accuracy: 0.3498
+
+itr 220 : test accuracy: 0.3493
+
+itr 240 : test accuracy: 0.3483
+
+itr 260 : test accuracy: 0.3583
+
+itr 280 : test accuracy: 0.3528
+
+itr 300 : test accuracy: 0.3504
+
+itr 320 : test accuracy: 0.3503
+
+itr 340 : test accuracy: 0.3500
+
+itr 360 : test accuracy: 0.3514
+
+itr 380 : test accuracy: 0.3508
+
+train | loss: 1.7217 | accuracy: 0.3673
+test | loss: 1.7768 | accuracy: 0.3524
+
+epoch: 14
+itr 0 : test accuracy: 0.3614
+
+itr 20 : test accuracy: 0.3580
+
+itr 40 : test accuracy: 0.3482
+
+itr 60 : test accuracy: 0.3542
+
+itr 80 : test accuracy: 0.3562
+
+itr 100 : test accuracy: 0.3584
+
+itr 120 : test accuracy: 0.3580
+
+itr 140 : test accuracy: 0.3570
+
+itr 160 : test accuracy: 0.3555
+
+itr 180 : test accuracy: 0.3567
+
+itr 200 : test accuracy: 0.3573
+
+itr 220 : test accuracy: 0.3596
+
+itr 240 : test accuracy: 0.3556
+
+itr 260 : test accuracy: 0.3563
+
+itr 280 : test accuracy: 0.3611
+
+itr 300 : test accuracy: 0.3578
+
+itr 320 : test accuracy: 0.3579
+
+itr 340 : test accuracy: 0.3589
+
+itr 360 : test accuracy: 0.3542
+
+itr 380 : test accuracy: 0.3565
+
+train | loss: 1.6859 | accuracy: 0.3776
+test | loss: 1.7666 | accuracy: 0.3607
+
+epoch: 15
+itr 0 : test accuracy: 0.3584
+
+itr 20 : test accuracy: 0.3606
+
+itr 40 : test accuracy: 0.3650
+
+itr 60 : test accuracy: 0.3667
+
+itr 80 : test accuracy: 0.3619
+
+itr 100 : test accuracy: 0.3657
+
+itr 120 : test accuracy: 0.3684
+
+itr 140 : test accuracy: 0.3632
+
+itr 160 : test accuracy: 0.3660
+
+itr 180 : test accuracy: 0.3717
+
+itr 200 : test accuracy: 0.3655
+
+itr 220 : test accuracy: 0.3672
+
+itr 240 : test accuracy: 0.3688
+
+itr 260 : test accuracy: 0.3673
+
+itr 280 : test accuracy: 0.3686
+
+itr 300 : test accuracy: 0.3751
+
+itr 320 : test accuracy: 0.3732
+
+itr 340 : test accuracy: 0.3672
+
+itr 360 : test accuracy: 0.3698
+
+itr 380 : test accuracy: 0.3702
+
+train | loss: 1.6502 | accuracy: 0.3939
+test | loss: 1.7437 | accuracy: 0.3664
+
+epoch: 16
+itr 0 : test accuracy: 0.3744
+
+itr 20 : test accuracy: 0.3693
+
+itr 40 : test accuracy: 0.3665
+
+itr 60 : test accuracy: 0.3763
+
+itr 80 : test accuracy: 0.3692
+
+itr 100 : test accuracy: 0.3760
+
+itr 120 : test accuracy: 0.3719
+
+itr 140 : test accuracy: 0.3680
+
+itr 160 : test accuracy: 0.3658
+
+itr 180 : test accuracy: 0.3713
+
+itr 200 : test accuracy: 0.3729
+
+itr 220 : test accuracy: 0.3703
+
+itr 240 : test accuracy: 0.3771
+
+itr 260 : test accuracy: 0.3736
+
+itr 280 : test accuracy: 0.3767
+
+itr 300 : test accuracy: 0.3704
+
+itr 320 : test accuracy: 0.3757
+
+itr 340 : test accuracy: 0.3717
+
+itr 360 : test accuracy: 0.3809
+
+itr 380 : test accuracy: 0.3727
+
+train | loss: 1.6190 | accuracy: 0.4043
+test | loss: 1.7387 | accuracy: 0.3724
+
+epoch: 17
+itr 0 : test accuracy: 0.3783
+
+itr 20 : test accuracy: 0.3773
+
+itr 40 : test accuracy: 0.3749
+
+itr 60 : test accuracy: 0.3780
+
+itr 80 : test accuracy: 0.3815
+
+itr 100 : test accuracy: 0.3776
+
+itr 120 : test accuracy: 0.3783
+
+itr 140 : test accuracy: 0.3843
+
+itr 160 : test accuracy: 0.3738
+
+itr 180 : test accuracy: 0.3785
+
+itr 200 : test accuracy: 0.3773
+
+itr 220 : test accuracy: 0.3824
+
+itr 240 : test accuracy: 0.3823
+
+itr 260 : test accuracy: 0.3839
+
+itr 280 : test accuracy: 0.3823
+
+itr 300 : test accuracy: 0.3770
+
+itr 320 : test accuracy: 0.3828
+
+itr 340 : test accuracy: 0.3781
+
+itr 360 : test accuracy: 0.3800
+
+itr 380 : test accuracy: 0.3879
+
+train | loss: 1.5878 | accuracy: 0.4141
+test | loss: 1.7010 | accuracy: 0.3851
+
+epoch: 18
+itr 0 : test accuracy: 0.3880
+
+itr 20 : test accuracy: 0.3851
+
+itr 40 : test accuracy: 0.3780
+
+itr 60 : test accuracy: 0.3866
+
+itr 80 : test accuracy: 0.3828
+
+itr 100 : test accuracy: 0.3866
+
+itr 120 : test accuracy: 0.3849
+
+itr 140 : test accuracy: 0.3876
+
+itr 160 : test accuracy: 0.3844
+
+itr 180 : test accuracy: 0.3858
+
+itr 200 : test accuracy: 0.3879
+
+itr 220 : test accuracy: 0.3824
+
+itr 240 : test accuracy: 0.3890
+
+itr 260 : test accuracy: 0.3846
+
+itr 280 : test accuracy: 0.3907
+
+itr 300 : test accuracy: 0.3868
+
+itr 320 : test accuracy: 0.3891
+
+itr 340 : test accuracy: 0.3930
+
+itr 360 : test accuracy: 0.3904
+
+itr 380 : test accuracy: 0.3846
+
+train | loss: 1.5538 | accuracy: 0.4266
+test | loss: 1.6942 | accuracy: 0.3890
+
+epoch: 19
+itr 0 : test accuracy: 0.3864
+
+itr 20 : test accuracy: 0.3931
+
+itr 40 : test accuracy: 0.3940
+
+itr 60 : test accuracy: 0.3856
+
+itr 80 : test accuracy: 0.3899
+
+itr 100 : test accuracy: 0.3875
+
+itr 120 : test accuracy: 0.3953
+
+itr 140 : test accuracy: 0.3993
+
+itr 160 : test accuracy: 0.3921
+
+itr 180 : test accuracy: 0.3927
+
+itr 200 : test accuracy: 0.3943
+
+itr 220 : test accuracy: 0.3914
+
+itr 240 : test accuracy: 0.3895
+
+itr 260 : test accuracy: 0.3949
+
+itr 280 : test accuracy: 0.3968
+
+itr 300 : test accuracy: 0.4008
+
+itr 320 : test accuracy: 0.4018
+
+itr 340 : test accuracy: 0.3993
+
+itr 360 : test accuracy: 0.4031
+
+itr 380 : test accuracy: 0.3992
+
+train | loss: 1.5262 | accuracy: 0.4393
+test | loss: 1.6838 | accuracy: 0.4029
+
+epoch: 20
+itr 0 : test accuracy: 0.3945
+
+itr 20 : test accuracy: 0.3918
+
+itr 40 : test accuracy: 0.4035
+
+itr 60 : test accuracy: 0.4003
+
+itr 80 : test accuracy: 0.4027
+
+itr 100 : test accuracy: 0.3998
+
+itr 120 : test accuracy: 0.3942
+
+itr 140 : test accuracy: 0.3960
+
+itr 160 : test accuracy: 0.4013
+
+itr 180 : test accuracy: 0.3977
+
+itr 200 : test accuracy: 0.3932
+
+itr 220 : test accuracy: 0.3941
+
+itr 240 : test accuracy: 0.3944
+
+itr 260 : test accuracy: 0.3973
+
+itr 280 : test accuracy: 0.3981
+
+itr 300 : test accuracy: 0.3982
+
+itr 320 : test accuracy: 0.3982
+
+itr 340 : test accuracy: 0.3923
+
+itr 360 : test accuracy: 0.4002
+
+itr 380 : test accuracy: 0.3973
+
+train | loss: 1.4972 | accuracy: 0.4496
+test | loss: 1.6819 | accuracy: 0.4033
+
+epoch: 21
+itr 0 : test accuracy: 0.4034
+
+itr 20 : test accuracy: 0.3977
+
+itr 40 : test accuracy: 0.4027
+
+itr 60 : test accuracy: 0.3984
+
+itr 80 : test accuracy: 0.3897
+
+itr 100 : test accuracy: 0.4028
+
+itr 120 : test accuracy: 0.3961
+
+itr 140 : test accuracy: 0.4030
+
+itr 160 : test accuracy: 0.4036
+
+itr 180 : test accuracy: 0.4019
+
+itr 200 : test accuracy: 0.4056
+
+itr 220 : test accuracy: 0.4090
+
+itr 240 : test accuracy: 0.4059
+
+itr 260 : test accuracy: 0.4046
+
+itr 280 : test accuracy: 0.4059
+
+itr 300 : test accuracy: 0.4091
+
+itr 320 : test accuracy: 0.4062
+
+itr 340 : test accuracy: 0.4090
+
+itr 360 : test accuracy: 0.4040
+
+itr 380 : test accuracy: 0.4127
+
+train | loss: 1.4687 | accuracy: 0.4636
+test | loss: 1.6660 | accuracy: 0.4077
+
+epoch: 22
+itr 0 : test accuracy: 0.4065
+
+itr 20 : test accuracy: 0.4048
+
+itr 40 : test accuracy: 0.4031
+
+itr 60 : test accuracy: 0.4108
+
+itr 80 : test accuracy: 0.4046
+
+itr 100 : test accuracy: 0.4079
+
+itr 120 : test accuracy: 0.4052
+
+itr 140 : test accuracy: 0.4101
+
+itr 160 : test accuracy: 0.4040
+
+itr 180 : test accuracy: 0.4109
+
+itr 200 : test accuracy: 0.4095
+
+itr 220 : test accuracy: 0.4112
+
+itr 240 : test accuracy: 0.4104
+
+itr 260 : test accuracy: 0.4102
+
+itr 280 : test accuracy: 0.4094
+
+itr 300 : test accuracy: 0.4017
+
+itr 320 : test accuracy: 0.4061
+
+itr 340 : test accuracy: 0.4096
+
+itr 360 : test accuracy: 0.4116
+
+itr 380 : test accuracy: 0.4123
+
+train | loss: 1.4399 | accuracy: 0.4721
+test | loss: 1.6728 | accuracy: 0.4107
+
+epoch: 23
+itr 0 : test accuracy: 0.4126
+
+itr 20 : test accuracy: 0.4106
+
+itr 40 : test accuracy: 0.4030
+
+itr 60 : test accuracy: 0.4035
+
+itr 80 : test accuracy: 0.4067
+
+itr 100 : test accuracy: 0.4122
+
+itr 120 : test accuracy: 0.4142
+
+itr 140 : test accuracy: 0.4148
+
+itr 160 : test accuracy: 0.4060
+
+itr 180 : test accuracy: 0.4177
+
+itr 200 : test accuracy: 0.4112
+
+itr 220 : test accuracy: 0.4161
+
+itr 240 : test accuracy: 0.4101
+
+itr 260 : test accuracy: 0.4075
+
+itr 280 : test accuracy: 0.4154
+
+itr 300 : test accuracy: 0.4072
+
+itr 320 : test accuracy: 0.4126
+
+itr 340 : test accuracy: 0.4206
+
+itr 360 : test accuracy: 0.4159
+
+itr 380 : test accuracy: 0.4066
+
+train | loss: 1.4173 | accuracy: 0.4781
+test | loss: 1.6600 | accuracy: 0.4182
+
+epoch: 24
+itr 0 : test accuracy: 0.4102
+
+itr 20 : test accuracy: 0.4061
+
+itr 40 : test accuracy: 0.4086
+
+itr 60 : test accuracy: 0.4161
+
+itr 80 : test accuracy: 0.4191
+
+itr 100 : test accuracy: 0.4177
+
+itr 120 : test accuracy: 0.4150
+
+itr 140 : test accuracy: 0.4164
+
+itr 160 : test accuracy: 0.4051
+
+itr 180 : test accuracy: 0.4130
+
+itr 200 : test accuracy: 0.4182
+
+itr 220 : test accuracy: 0.4138
+
+itr 240 : test accuracy: 0.4139
+
+itr 260 : test accuracy: 0.4146
+
+itr 280 : test accuracy: 0.4190
+
+itr 300 : test accuracy: 0.4153
+
+itr 320 : test accuracy: 0.4122
+
+itr 340 : test accuracy: 0.4219
+
+itr 360 : test accuracy: 0.4170
+
+itr 380 : test accuracy: 0.4150
+
+train | loss: 1.3934 | accuracy: 0.4865
+test | loss: 1.6451 | accuracy: 0.4128
+
+epoch: 25
+itr 0 : test accuracy: 0.4209
+
+itr 20 : test accuracy: 0.4167
+
+itr 40 : test accuracy: 0.4173
+
+itr 60 : test accuracy: 0.4215
+
+itr 80 : test accuracy: 0.4159
+
+itr 100 : test accuracy: 0.4150
+
+itr 120 : test accuracy: 0.4235
+
+itr 140 : test accuracy: 0.4212
+
+itr 160 : test accuracy: 0.4189
+
+itr 180 : test accuracy: 0.4253
+
+itr 200 : test accuracy: 0.4191
+
+itr 220 : test accuracy: 0.4208
+
+itr 240 : test accuracy: 0.4177
+
+itr 260 : test accuracy: 0.4192
+
+itr 280 : test accuracy: 0.4204
+
+itr 300 : test accuracy: 0.4162
+
+itr 320 : test accuracy: 0.4135
+
+itr 340 : test accuracy: 0.4245
+
+itr 360 : test accuracy: 0.4168
+
+itr 380 : test accuracy: 0.4199
+
+train | loss: 1.3760 | accuracy: 0.4900
+test | loss: 1.6594 | accuracy: 0.4151
+
+epoch: 26
+itr 0 : test accuracy: 0.4176
+
+itr 20 : test accuracy: 0.4237
+
+itr 40 : test accuracy: 0.4186
+
+itr 60 : test accuracy: 0.4270
+
+itr 80 : test accuracy: 0.4140
+
+itr 100 : test accuracy: 0.4224
+
+itr 120 : test accuracy: 0.4255
+
+itr 140 : test accuracy: 0.4182
+
+itr 160 : test accuracy: 0.4168
+
+itr 180 : test accuracy: 0.4219
+
+itr 200 : test accuracy: 0.4216
+
+itr 220 : test accuracy: 0.4256
+
+itr 240 : test accuracy: 0.4222
+
+itr 260 : test accuracy: 0.4171
+
+itr 280 : test accuracy: 0.4177
+
+itr 300 : test accuracy: 0.4279
+
+itr 320 : test accuracy: 0.4215
+
+itr 340 : test accuracy: 0.4250
+
+itr 360 : test accuracy: 0.4276
+
+itr 380 : test accuracy: 0.4269
+
+train | loss: 1.3553 | accuracy: 0.4995
+test | loss: 1.6377 | accuracy: 0.4298
+
+epoch: 27
+itr 0 : test accuracy: 0.4237
+
+itr 20 : test accuracy: 0.4213
+
+itr 40 : test accuracy: 0.4219
+
+itr 60 : test accuracy: 0.4237
+
+itr 80 : test accuracy: 0.4214
+
+itr 100 : test accuracy: 0.4225
+
+itr 120 : test accuracy: 0.4267
+
+itr 140 : test accuracy: 0.4228
+
+itr 160 : test accuracy: 0.4191
+
+itr 180 : test accuracy: 0.4254
+
+itr 200 : test accuracy: 0.4279
+
+itr 220 : test accuracy: 0.4215
+
+itr 240 : test accuracy: 0.4245
+
